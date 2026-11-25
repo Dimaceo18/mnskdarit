@@ -14,6 +14,7 @@ SCHEMA='''CREATE TABLE IF NOT EXISTS rounds(id bigserial PRIMARY KEY, test boole
 CREATE UNIQUE INDEX IF NOT EXISTS one_active ON rounds ((1)) WHERE status='active';
 CREATE TABLE IF NOT EXISTS players(round_id bigint REFERENCES rounds(id) ON DELETE CASCADE, uid bigint, ref bigint, eligible_new boolean NOT NULL, joined timestamptz, PRIMARY KEY(round_id,uid));
 CREATE TABLE IF NOT EXISTS links(round_id bigint REFERENCES rounds(id) ON DELETE CASCADE, uid bigint, link text UNIQUE, PRIMARY KEY(round_id,uid));
+CREATE TABLE IF NOT EXISTS join_link_history(round_id bigint REFERENCES rounds(id) ON DELETE CASCADE, uid bigint NOT NULL, link text PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS winners(round_id bigint REFERENCES rounds(id) ON DELETE CASCADE, uid bigint, prize text, notified boolean DEFAULT false, PRIMARY KEY(round_id,uid));'''
 def kb(*rows):
  return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, **({'url':v} if v.startswith('https://') else {'callback_data':v})) for t,v in row] for row in rows])
@@ -36,11 +37,17 @@ async def show(m,uid):
  p=await db.fetchrow('SELECT * FROM players WHERE round_id=$1 AND uid=$2',r['id'],uid)
  if not p: return await m.answer('Отправьте /start для регистрации.')
  if not await member(uid):
-  link=await db.fetchval('SELECT link FROM links WHERE round_id=$1 AND uid=$2',r['id'],uid)
-  if not link:
-   invite=await bot.create_chat_invite_link(CHANNEL,creates_join_request=True,expire_date=r['ends'])
-   link=await db.fetchval('INSERT INTO links VALUES($1,$2,$3) ON CONFLICT(round_id,uid) DO UPDATE SET uid=EXCLUDED.uid RETURNING link',r['id'],uid,invite.invite_link)
-  return await m.answer('Подайте заявку на вступление в Минский ТГ. Бот автоматически одобрит её и начислит билет.',reply_markup=kb([('Подписаться на канал',link)],[('Проверить подписку','check')]))
+  # Generate a fresh link on every request, retaining the previous link mapping
+  # until the new link has been created successfully.
+  try:
+   invite=await bot.create_chat_invite_link(CHANNEL,creates_join_request=True,expire_date=r['ends']+timedelta(minutes=5))
+   link=await db.fetchval('INSERT INTO links VALUES($1,$2,$3) ON CONFLICT(round_id,uid) DO UPDATE SET link=EXCLUDED.link RETURNING link',r['id'],uid,invite.invite_link)
+   await db.execute('INSERT INTO join_link_history VALUES($1,$2,$3) ON CONFLICT DO NOTHING',r['id'],uid,link)
+   logging.info('Fresh join link created for round %s',r['id'])
+  except TelegramAPIError:
+   logging.exception('Could not create join link')
+   return await m.answer('Не удалось создать ссылку. Попробуйте обновить её.',reply_markup=kb([('Обновить ссылку','check')]))
+  return await m.answer('Подайте заявку на вступление в Минский ТГ. Бот автоматически одобрит её и начислит билет. Используйте последнюю ссылку, пока розыгрыш активен.',reply_markup=kb([('Подписаться на канал',link)],[('Обновить ссылку / проверить подписку','check')]))
  await db.execute('UPDATE players SET joined=COALESCE(joined,now()) WHERE round_id=$1 AND uid=$2',r['id'],uid)
  # Only query this participant’s referrals, not the entire audience.
  cutoff=datetime.now(timezone.utc)-timedelta(hours=0 if r['test'] else 24)
@@ -73,7 +80,7 @@ class PrivateReply:
 @dp.chat_join_request()
 async def join(j:ChatJoinRequest):
  if j.chat.id!=CHANNEL or not j.invite_link: return
- p=await db.fetchrow("SELECT l.*,r.test,r.ends FROM links l JOIN rounds r ON r.id=l.round_id WHERE l.link=$1 AND r.status='active'",j.invite_link.invite_link)
+ p=await db.fetchrow("SELECT l.*,r.test,r.ends FROM (SELECT round_id,uid,link FROM links UNION SELECT round_id,uid,link FROM join_link_history) l JOIN rounds r ON r.id=l.round_id WHERE l.link=$1 AND r.status='active'",j.invite_link.invite_link)
  if not p or p['uid']!=j.from_user.id or p['ends']<=datetime.now(timezone.utc): return
  await bot.approve_chat_join_request(CHANNEL,j.from_user.id)
  await db.execute('UPDATE players SET joined=COALESCE(joined,now()) WHERE round_id=$1 AND uid=$2',p['round_id'],p['uid'])
