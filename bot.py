@@ -8,7 +8,6 @@ from aiogram.exceptions import TelegramAPIError
 
 logging.basicConfig(level=logging.INFO)
 TOKEN=os.environ['BOT_TOKEN']; ADMIN=int(os.environ['ADMIN_ID']); CHANNEL=int(os.environ['CHANNEL_ID'])
-TESTERS={ADMIN}|{int(x) for x in os.getenv('TESTER_IDS','').split(',') if x.strip()}
 LINK=os.getenv('CHANNEL_INVITE_LINK','https://t.me/+lwdIQrNOfaU5NmMy')
 bot=Bot(TOKEN); dp=Dispatcher(); db=None; username=''
 SCHEMA='''CREATE TABLE IF NOT EXISTS rounds(id bigserial PRIMARY KEY, test boolean NOT NULL, ends timestamptz NOT NULL, status text NOT NULL DEFAULT 'active');
@@ -34,7 +33,6 @@ async def counts(r):
 async def show(m,uid):
  r=await active()
  if not r or r['ends']<=datetime.now(timezone.utc): return await m.answer('Сейчас нет активного розыгрыша.')
- if r['test'] and uid not in TESTERS: return await m.answer('Бот пока проходит закрытое тестирование.')
  p=await db.fetchrow('SELECT * FROM players WHERE round_id=$1 AND uid=$2',r['id'],uid)
  if not p: return await m.answer('Отправьте /start для регистрации.')
  if not await member(uid):
@@ -42,7 +40,7 @@ async def show(m,uid):
   if not link:
    invite=await bot.create_chat_invite_link(CHANNEL,creates_join_request=True,expire_date=r['ends'])
    link=await db.fetchval('INSERT INTO links VALUES($1,$2,$3) ON CONFLICT(round_id,uid) DO UPDATE SET uid=EXCLUDED.uid RETURNING link',r['id'],uid,invite.invite_link)
-  return await m.answer('Подпишитесь на Минский ТГ, затем проверьте подписку.',reply_markup=kb([('Подписаться',link)],[('Проверить подписку','check')]))
+  return await m.answer('Подайте заявку на вступление в Минский ТГ. Бот автоматически одобрит её и начислит билет.',reply_markup=kb([('Подписаться на канал',link)],[('Проверить подписку','check')]))
  await db.execute('UPDATE players SET joined=COALESCE(joined,now()) WHERE round_id=$1 AND uid=$2',r['id'],uid)
  # Only query this participant’s referrals, not the entire audience.
  cutoff=datetime.now(timezone.utc)-timedelta(hours=0 if r['test'] else 24)
@@ -52,8 +50,7 @@ async def show(m,uid):
 @dp.message(CommandStart())
 async def start(m:Message):
  r=await active(); uid=m.from_user.id
- if not r or r['ends']<=datetime.now(timezone.utc): return await m.answer('Сейчас нет активного розыгрыша. Администратор: /admin')
- if r['test'] and uid not in TESTERS: return await m.answer('Закрытое тестирование.')
+ if not r or r['ends']<=datetime.now(timezone.utc): return await m.answer('Сейчас нет активного розыгрыша.')
  ref=None; parts=m.text.split(maxsplit=1)
  if len(parts)>1:
   try:
@@ -70,16 +67,26 @@ async def check(c:CallbackQuery):
 async def prizes(c:CallbackQuery):
  await c.answer(); r=await active()
  await c.message.answer('Тест: 3 виртуальных приза.' if r and r['test'] else '1 Яндекс Станция Мини\n10 сертификатов WB по 50 BYN\n50 подарков Telegram')
+class PrivateReply:
+ def __init__(self,uid): self.uid=uid
+ async def answer(self,text,**kwargs): return await bot.send_message(self.uid,text,**kwargs)
 @dp.chat_join_request()
 async def join(j:ChatJoinRequest):
  if j.chat.id!=CHANNEL or not j.invite_link: return
  p=await db.fetchrow("SELECT l.*,r.test,r.ends FROM links l JOIN rounds r ON r.id=l.round_id WHERE l.link=$1 AND r.status='active'",j.invite_link.invite_link)
  if not p or p['uid']!=j.from_user.id or p['ends']<=datetime.now(timezone.utc): return
- if p['test'] and j.from_user.id not in TESTERS: return
  await bot.approve_chat_join_request(CHANNEL,j.from_user.id)
  await db.execute('UPDATE players SET joined=COALESCE(joined,now()) WHERE round_id=$1 AND uid=$2',p['round_id'],p['uid'])
- try: await bot.send_message(p['uid'],'Подписка подтверждена! Нажмите /start, чтобы увидеть билеты.')
+ try:
+  await bot.send_message(p['uid'],'✅ Подписка подтверждена! Ваш билет начислен.')
+  await show(PrivateReply(p['uid']),p['uid'])
  except TelegramAPIError: logging.exception('join notification')
+ ref=await db.fetchval('SELECT ref FROM players WHERE round_id=$1 AND uid=$2 AND eligible_new',p['round_id'],p['uid'])
+ if ref and p['test']:
+  try:
+   await bot.send_message(ref,'🎉 Ваш друг вступил в канал! Вам начислен дополнительный билет, если вы остаётесь подписчиком.')
+   await show(PrivateReply(ref),ref)
+  except TelegramAPIError: logging.exception('referral notification')
 @dp.chat_member()
 async def change(e:ChatMemberUpdated):
  if e.chat.id!=CHANNEL: return
@@ -90,7 +97,7 @@ async def change(e:ChatMemberUpdated):
 async def admin(m:Message):
  if m.from_user.id!=ADMIN:return
  r=await active()
- await m.answer('Управление: '+(f'активен #{r["id"]}' if r else 'нет розыгрыша'),reply_markup=kb([('🧪 Тест 5 минут','test')],[('Статистика','stats'),('Завершить тест','finish')],[('Удалить тесты','purge')],[('Реальный розыгрыш','live')]))
+ await m.answer('Управление: '+(f'активен #{r["id"]}' if r else 'нет розыгрыша'),reply_markup=kb([('🧪 Тест 30 минут','test')],[('Статистика','stats'),('Завершить тест','finish')],[('Удалить тесты','purge')],[('Реальный розыгрыш','live')]))
 @dp.message(Command('diagnostics'))
 async def diagnostics(m:Message):
  if m.from_user.id!=ADMIN:return
@@ -126,7 +133,7 @@ async def control(c:CallbackQuery):
  if a=='live':return await c.message.answer('Реальный режим пока заблокирован: сначала проверяем тест и условия акции.')
  if a=='test':
   if r:return await c.message.answer('Уже есть активный розыгрыш.')
-  await db.execute("INSERT INTO rounds(test,ends) VALUES(true,now()+interval '5 minutes')")
+  await db.execute("INSERT INTO rounds(test,ends) VALUES(true,now()+interval '30 minutes')")
   return await c.message.answer('Тест запущен. /start')
  if a=='stats':
   if not r:return await c.message.answer('Нет активного розыгрыша.')
