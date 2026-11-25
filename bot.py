@@ -1,9 +1,10 @@
-import asyncio, os, logging, secrets, signal
+import asyncio, os, logging, secrets, signal, csv, io
+from urllib.parse import urlencode
 from datetime import datetime, timezone, timedelta
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, ChatJoinRequest, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, ChatJoinRequest, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.exceptions import TelegramAPIError
 
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +59,10 @@ async def show(m,uid):
  cutoff=datetime.now(timezone.utc)-timedelta(hours=0 if r['test'] else 24)
  n=await db.fetchval('SELECT count(*) FROM players WHERE round_id=$1 AND ref=$2 AND eligible_new AND joined<=$3',r['id'],uid,cutoff)
  url=f'https://t.me/{username}?start=r{r["id"]}_{uid}'
- await m.answer(('🧪 ТЕСТ: призы виртуальные\n' if r['test'] else '')+f'🎁 Минский ТГ\nБилетов: {weight(n)}\nПодтверждённых друзей: {n}\nВаша ссылка: {url}\nИтоги: {r["ends"].astimezone(timezone(timedelta(hours=3))):%d.%m %H:%M} (Минск)',reply_markup=kb([('Обновить билеты','check')],[('Призы','prizes')]))
+ share='https://t.me/share/url?'+urlencode({'url':url,'text':'Участвуй в розыгрыше Минский ТГ!'})
+ remaining=max(0,int((r['ends']-datetime.now(timezone.utc)).total_seconds()))
+ progress=next((f'До бонуса за {k} друзей: ещё {k-n}' for k in (5,10,20) if n<k),'Все бонусы получены!')
+ await m.answer(('🧪 ПРОБНЫЙ РОЗЫГРЫШ: призы виртуальные\n\n' if r['test'] else '')+f'🎁 Минский ТГ дарит подарки!\n\n🎟 Ваши билеты: {weight(n)}\n👥 Подтверждённых друзей: {n}\n{progress}\n\nДо итогов: {remaining//3600} ч {(remaining%3600)//60} мин\nИтоги: {r["ends"].astimezone(timezone(timedelta(hours=3))):%d.%m %H:%M} (Минск)\n\nВаша ссылка:\n{url}',reply_markup=kb([('👥 Пригласить друга',share)],[('🎟 Мои билеты','check'),('🎁 Призы','prizes')],[('📋 Правила','rules'),('🏆 Результаты','public_results')]))
 @dp.message(CommandStart())
 async def start(m:Message):
  r=await active(); uid=m.from_user.id
@@ -79,6 +83,15 @@ async def check(c:CallbackQuery):
 async def prizes(c:CallbackQuery):
  await c.answer(); r=await active()
  await c.message.answer('Тест: 3 виртуальных приза.' if r and r['test'] else '1 Яндекс Станция Мини\n10 сертификатов WB по 50 BYN\n50 подарков Telegram')
+@dp.callback_query(F.data=='rules')
+async def rules(c:CallbackQuery):
+ await c.answer(); await c.message.answer('📋 Правила\n1. Подпишитесь на Минский ТГ: 1 билет.\n2. Каждый новый подтверждённый друг: +1 билет.\n3. Бонусы за 5, 10 и 20 друзей: +3, +7 и +15 (суммируются).\n4. Один приз на участника. Перед итогами проверяется подписка.\n5. В тесте подарки виртуальные.')
+@dp.callback_query(F.data=='public_results')
+async def public_results(c:CallbackQuery):
+ await c.answer(); rid=await db.fetchval("SELECT max(id) FROM rounds WHERE status='finished'")
+ if not rid:return await c.message.answer('Итогов пока нет.')
+ prize=await db.fetchval('SELECT prize FROM winners WHERE round_id=$1 AND uid=$2',rid,c.from_user.id)
+ await c.message.answer(f'Последний завершённый розыгрыш #{rid}. '+(f'Ваш приз: {prize}' if prize else 'Вы не выиграли в этом розыгрыше.'))
 class PrivateReply:
  def __init__(self,uid): self.uid=uid
  async def answer(self,text,**kwargs): return await bot.send_message(self.uid,text,**kwargs)
@@ -113,7 +126,7 @@ async def change(e:ChatMemberUpdated):
 async def admin(m:Message):
  if m.from_user.id!=ADMIN:return
  r=await active()
- await m.answer('Управление: '+(f'активен #{r["id"]}' if r else 'нет розыгрыша'),reply_markup=kb([('🧪 Тест 30 минут','test')],[('Статистика','stats'),('Завершить тест','finish')],[('Удалить тесты','purge')],[('Реальный розыгрыш','live')]))
+ await m.answer('Управление: '+(f'активен #{r["id"]}' if r else 'нет розыгрыша'),reply_markup=kb([('🧪 30 минут','test'),('🧪 2 часа','test120')],[('🧪 24 часа','test1440')],[('Статистика','stats'),('Завершить тест','finish')],[('📥 CSV участников','export')],[('Удалить тесты','purge')],[('Реальный розыгрыш','live')]))
 @dp.message(Command('diagnostics'))
 async def diagnostics(m:Message):
  if m.from_user.id!=ADMIN:return
@@ -142,18 +155,24 @@ async def results(m:Message):
  if m.from_user.id!=ADMIN:return
  rows=await db.fetch('SELECT * FROM winners WHERE round_id=(SELECT max(id) FROM rounds WHERE status=\'finished\') ORDER BY uid')
  await m.answer('\n'.join(f'{p["uid"]}: {p["prize"]}' for p in rows)[:3900] or 'Нет результатов')
-@dp.callback_query(F.data.in_({'test','stats','finish','purge','live','live_yes'}))
+@dp.callback_query(F.data.in_({'test','test120','test1440','stats','finish','purge','live','live_yes','export'}))
 async def control(c:CallbackQuery):
  if c.from_user.id!=ADMIN:return await c.answer('Нет доступа',show_alert=True)
  await c.answer(); r=await active(); a=c.data
  if a=='live':return await c.message.answer('Реальный режим пока заблокирован: сначала проверяем тест и условия акции.')
- if a=='test':
+ if a in ('test','test120','test1440'):
   if r:return await c.message.answer('Уже есть активный розыгрыш.')
-  await db.execute("INSERT INTO rounds(test,ends) VALUES(true,now()+interval '30 minutes')")
+  await db.execute("INSERT INTO rounds(test,ends) VALUES(true,now()+$1::interval)",timedelta(minutes={'test':30,'test120':120,'test1440':1440}[a]))
   return await c.message.answer('Тест запущен. /start')
+ if a=='export':
+  rid=r['id'] if r else await db.fetchval('SELECT max(id) FROM rounds')
+  if not rid:return await c.message.answer('Нет данных.')
+  rows=await db.fetch('SELECT uid,ref,eligible_new,joined FROM players WHERE round_id=$1 ORDER BY uid',rid)
+  out=io.StringIO(); writer=csv.writer(out); writer.writerow(['user_id','referrer_id','new_subscriber','joined_at']); writer.writerows([tuple(row) for row in rows])
+  return await c.message.answer_document(BufferedInputFile(out.getvalue().encode('utf-8-sig'),filename=f'round_{rid}.csv'))
  if a=='stats':
   if not r:return await c.message.answer('Нет активного розыгрыша.')
-  n=await db.fetchval('SELECT count(*) FROM players WHERE round_id=$1',r['id']); return await c.message.answer(f'Участников: {n}')
+  n=await db.fetchval('SELECT count(*) FROM players WHERE round_id=$1',r['id']); confirmed=await db.fetchval('SELECT count(*) FROM players WHERE round_id=$1 AND joined IS NOT NULL',r['id']); referred=await db.fetchval('SELECT count(*) FROM players WHERE round_id=$1 AND joined IS NOT NULL AND eligible_new AND ref IS NOT NULL',r['id']); return await c.message.answer(f'Регистраций: {n}\nПодтверждённых по базе: {confirmed}\nНовых по реферальным ссылкам: {referred}')
  if a=='finish' and r and r['test']:await finish(r);return
  if a=='purge':
   if r:return await c.message.answer('Сначала завершите активный тест.')
