@@ -37,17 +37,22 @@ async def show(m,uid):
  p=await db.fetchrow('SELECT * FROM players WHERE round_id=$1 AND uid=$2',r['id'],uid)
  if not p: return await m.answer('Отправьте /start для регистрации.')
  if not await member(uid):
+  status=await bot.get_chat_member(CHANNEL,uid)
+  if status.status=='kicked':
+   logging.warning('User %s is banned from channel',uid)
+   return await m.answer('Ваш аккаунт находится в списке удалённых или заблокированных пользователей канала. Обратитесь к администратору канала.')
   # Generate a fresh link on every request, retaining the previous link mapping
   # until the new link has been created successfully.
   try:
-   invite=await bot.create_chat_invite_link(CHANNEL,creates_join_request=True,expire_date=r['ends']+timedelta(minutes=5))
+   invite=await bot.create_chat_invite_link(CHANNEL,creates_join_request=True)
+   logging.info('Invite metadata: round=%s revoked=%s expires=%s join_request=%s',r['id'],invite.is_revoked,invite.expire_date,invite.creates_join_request)
    link=await db.fetchval('INSERT INTO links VALUES($1,$2,$3) ON CONFLICT(round_id,uid) DO UPDATE SET link=EXCLUDED.link RETURNING link',r['id'],uid,invite.invite_link)
    await db.execute('INSERT INTO join_link_history VALUES($1,$2,$3) ON CONFLICT DO NOTHING',r['id'],uid,link)
    logging.info('Fresh join link created for round %s',r['id'])
   except TelegramAPIError:
    logging.exception('Could not create join link')
    return await m.answer('Не удалось создать ссылку. Попробуйте обновить её.',reply_markup=kb([('Обновить ссылку','check')]))
-  return await m.answer('Подайте заявку на вступление в Минский ТГ. Бот автоматически одобрит её и начислит билет. Используйте последнюю ссылку, пока розыгрыш активен.',reply_markup=kb([('Подписаться на канал',link)],[('Обновить ссылку / проверить подписку','check')]))
+  return await m.answer('Подайте заявку на вступление в Минский ТГ. Бот автоматически одобрит её и начислит билет. Подайте заявку до окончания розыгрыша.',reply_markup=kb([('Подписаться на канал',link)],[('Обновить ссылку / проверить подписку','check')]))
  await db.execute('UPDATE players SET joined=COALESCE(joined,now()) WHERE round_id=$1 AND uid=$2',r['id'],uid)
  # Only query this participant’s referrals, not the entire audience.
  cutoff=datetime.now(timezone.utc)-timedelta(hours=0 if r['test'] else 24)
@@ -79,10 +84,14 @@ class PrivateReply:
  async def answer(self,text,**kwargs): return await bot.send_message(self.uid,text,**kwargs)
 @dp.chat_join_request()
 async def join(j:ChatJoinRequest):
+ logging.info('Join request received: chat=%s user=%s',j.chat.id,j.from_user.id)
  if j.chat.id!=CHANNEL or not j.invite_link: return
  p=await db.fetchrow("SELECT l.*,r.test,r.ends FROM (SELECT round_id,uid,link FROM links UNION SELECT round_id,uid,link FROM join_link_history) l JOIN rounds r ON r.id=l.round_id WHERE l.link=$1 AND r.status='active'",j.invite_link.invite_link)
- if not p or p['uid']!=j.from_user.id or p['ends']<=datetime.now(timezone.utc): return
+ if not p or p['uid']!=j.from_user.id or p['ends']<=datetime.now(timezone.utc):
+  logging.warning('Join request not approved: unmatched user/link or expired round')
+  return
  await bot.approve_chat_join_request(CHANNEL,j.from_user.id)
+ logging.info('Join request approved: user=%s round=%s',j.from_user.id,p['round_id'])
  await db.execute('UPDATE players SET joined=COALESCE(joined,now()) WHERE round_id=$1 AND uid=$2',p['round_id'],p['uid'])
  try:
   await bot.send_message(p['uid'],'✅ Подписка подтверждена! Ваш билет начислен.')
